@@ -326,6 +326,12 @@ struct Sum {
     dynamic: Option<Value>,
 }
 
+/// Only actual memory instructions may fall back to the runtime address map.
+enum AddressUse {
+    Memory,
+    Descriptor,
+}
+
 struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
@@ -672,7 +678,7 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.address(lo, hi, extra, AddressUse::Memory)
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -687,6 +693,7 @@ impl<'a> Tracer<'a> {
                         offset: off,
                         dynamic: None,
                     },
+                    AddressUse::Memory,
                 )
             }
         }
@@ -694,9 +701,30 @@ impl<'a> Tracer<'a> {
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+    fn address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        usage: AddressUse,
+    ) -> Result<Address, &'static str> {
         let (lo, hi) = (self.unlaned(lo), self.unlaned(hi));
         let s = self.sum(lo);
+        if s.base.is_none()
+            && s.dynamic
+                .is_some_and(|v| self.first_lane_source(v).is_some())
+        {
+            if matches!(usage, AddressUse::Memory)
+                && self.has_runtime_address_provenance(lo, hi, extra.dynamic)
+            {
+                return Ok(Address {
+                    param: GLOBAL,
+                    offset: 0,
+                    dynamic: None,
+                });
+            }
+            return Err(self.why_no_base(s.dynamic));
+        }
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
@@ -799,6 +827,41 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// A first-lane read can hide a code-table address. Follow both address
+    /// words and the offset through SSA (including phi edges) before using the
+    /// runtime map, which cannot address the shader's own code.
+    fn has_runtime_address_provenance(&self, lo: Term, hi: Term, offset: Option<Value>) -> bool {
+        let mut values: Vec<_> = [lo, hi]
+            .into_iter()
+            .filter_map(|word| match word {
+                Term::Value(v) => Some(v),
+                Term::Const(_) => None,
+            })
+            .chain(offset)
+            .collect();
+        let mut seen = vec![false; self.defs.len()];
+        while let Some(v) = values.pop() {
+            let i = v.0 as usize;
+            let Some(seen) = seen.get_mut(i) else {
+                return false;
+            };
+            if std::mem::replace(seen, true) {
+                continue;
+            }
+            if let Some(inst) = self.def(v) {
+                if inst.name() == "s_getpc_b64" {
+                    return false;
+                }
+                values.extend(inst.reads.iter().map(|&(_, value)| value));
+            } else if let Some((block, phi)) = self.phis[i] {
+                values.extend(self.p.blocks[block].phis[phi].args.iter().copied());
+            } else if self.inputs[i].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The terms of the additions that compute `v`.
     fn leaves(&self, v: Value) -> Box<dyn Iterator<Item = Value> + '_> {
         match self.sop2(v, &["s_add_u32", "s_add_i32"]) {
@@ -832,7 +895,7 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra, AddressUse::Memory)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -904,6 +967,7 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
+                AddressUse::Descriptor,
             )?;
             return Ok(Source::Built {
                 address,
@@ -1862,6 +1926,24 @@ pub(crate) mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    #[test]
+    fn a_per_lane_runtime_pointer_stays_on_the_address_map() {
+        // Synthetic gfx1030: each half comes from a lane-varying input
+        // rather than from a program-counter-relative table.
+        let resources = track_words(
+            &[
+                0x7E04_0500, // v_readfirstlane_b32 s2, v0
+                0x7E06_0502, // v_readfirstlane_b32 s3, v2
+                0xF400_0181,
+                0xFA00_0000, // s_load_dword s6, s[2:3], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(resources.scalar.as_slice(), &[((0, 2), at(GLOBAL, 0))]);
+    }
+
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
@@ -2210,6 +2292,21 @@ pub(crate) mod tests {
                 what: "an address read from the first lane of a per-lane value"
             }
         );
+    }
+
+    #[test]
+    fn a_code_relative_high_word_keeps_a_first_lane_address_out_of_the_runtime_map() {
+        // Drop the constant assignment to v0 and use its incoming value as
+        // the low word. The high word still depends on s_getpc_b64.
+        let mut words = CODE_TABLE_FIRST_LANE.to_vec();
+        words.remove(4); // v_mov_b32 v0, 3
+        words[8] = 0x7E04_0500; // v_readfirstlane_b32 s2, v0
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(matches!(
+            track(&p, &[], HwStage::Cs, lanes(&p).as_ref()),
+            Err(ShaderError::Unsupported { offset: 44, .. })
+        ));
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
