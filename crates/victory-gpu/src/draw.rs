@@ -648,7 +648,7 @@ impl State {
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
                 if let Some(view) = crate::descriptor::view(handle) {
                     if preview && let Some(texture) = crate::producers::texture_of(&view) {
-                        crate::capture::note_target(texture as This);
+                        crate::capture::note_dropped_target(texture as This);
                     }
                     if producers {
                         crate::producers::dropped_write(&format!("{stage} {hash}"), &view);

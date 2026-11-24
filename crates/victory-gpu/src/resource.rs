@@ -1783,6 +1783,76 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn dropped_uav_targets_are_listed_but_cannot_win_the_preview() {
+        use crate::capture::{note_dropped_target, note_target, shown, target_is_listed_for_test};
+        // The process-wide preview setting is intentionally left untouched.
+        if std::env::var("VICTORY_SHOW_TARGET").as_deref() != Ok("busiest") {
+            return;
+        }
+        assert!(
+            crate::host::host().is_some(),
+            "this test needs a D3D12 adapter"
+        );
+        let create = || {
+            let null: This = std::ptr::null();
+            let desc = ResourceDesc {
+                flags: 1 | 4,
+                ..texture(1280, 720, 28, 1)
+            };
+            let mut result = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut result
+                ),
+                S_OK
+            );
+            assert!(host_copy(result).is_some());
+            result
+        };
+        let skipped = create();
+        let live = create();
+        note_dropped_target(skipped);
+        assert!(target_is_listed_for_test(skipped));
+        let only_dropped = shown(64);
+        note_target(live);
+        for _ in 0..16 {
+            note_dropped_target(skipped);
+        }
+        assert!(target_is_listed_for_test(skipped));
+        let mixed = shown(128);
+        // A previously dropped texture remains eligible once actually used.
+        for _ in 0..8 {
+            note_target(skipped);
+        }
+        let once_live = shown(192);
+        let picked_live =
+            mixed.is_some_and(|picked| std::sync::Arc::ptr_eq(&picked, &host_copy(live).unwrap()));
+        let picked_skipped_once_live = once_live
+            .is_some_and(|picked| std::sync::Arc::ptr_eq(&picked, &host_copy(skipped).unwrap()));
+        println!(
+            "listed dropped target; dropped-only picked: {}; mixed picked live: {picked_live}; later live use selected: {picked_skipped_once_live}",
+            only_dropped.is_some(),
+        );
+        for resource in [skipped, live] {
+            slot::<Release>(resource, 0x10)(resource);
+        }
+        assert!(only_dropped.is_none(), "a dropped-only target was picked");
+        assert!(picked_live, "dropped use outscored a real bind");
+        assert!(
+            picked_skipped_once_live,
+            "a once-dropped target must be eligible after a real bind"
+        );
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

@@ -418,11 +418,11 @@ fn displayable(d: &D3D12_RESOURCE_DESC) -> bool {
 }
 
 /// The index of the displayable target bound most often (the last of
-/// equals), given each target's description and binds.
+/// equals), excluding targets only listed for dropped work.
 fn busiest(seen: &[(D3D12_RESOURCE_DESC, u32)]) -> Option<usize> {
     seen.iter()
         .enumerate()
-        .filter(|(_, (d, _))| displayable(d))
+        .filter(|(_, (d, n))| *n != 0 && displayable(d))
         .max_by_key(|(_, (_, n))| *n)
         .map(|(i, _)| i)
 }
@@ -435,8 +435,22 @@ fn presentable(d: &D3D12_RESOURCE_DESC) -> bool {
         && d.SampleDesc.Count == 1
 }
 
+/// Keeps a dropped UAV target visible in the target list.
+pub(crate) fn note_dropped_target(resource: crate::object::This) {
+    record_target(resource, false);
+}
+
+#[cfg(test)]
+pub(crate) fn target_is_listed_for_test(resource: crate::object::This) -> bool {
+    TARGETS.lock().unwrap().iter().any(|(id, _)| *id == resource as usize)
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    record_target(resource, true);
+}
+
+fn record_target(resource: crate::object::This, count_bind: bool) {
     if resource.is_null() {
         return;
     }
@@ -444,7 +458,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
     if !dumping && show_index().is_none() {
         return;
     }
-    if show_index().is_some() {
+    if count_bind && show_index().is_some() {
         let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
         hit(hits.get_or_insert_with(std::collections::HashMap::new), resource as usize);
     }
