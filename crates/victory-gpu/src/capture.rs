@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+pub(crate) mod dispatch_probe;
+
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 

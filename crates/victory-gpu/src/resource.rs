@@ -1783,6 +1783,223 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn dispatch_probe_reads_bound_r8_textures_at_the_recorded_points() {
+        use crate::capture::dispatch_probe::Probe;
+        use crate::descriptor::{View, host::HostHeap};
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            Event, Metadata, Subscriber,
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+        };
+        use victory_shader::ResourceType;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        #[derive(Default, Debug, PartialEq)]
+        struct Row {
+            phase: String,
+            resource: String,
+            nonzero: u64,
+            max_raw: u64,
+        }
+        impl Visit for Row {
+            fn record_u64(&mut self, f: &Field, v: u64) {
+                match f.name() {
+                    "nonzero" => self.nonzero = v,
+                    "max_raw" => self.max_raw = v,
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                match f.name() {
+                    "phase" => self.phase = format!("{v:?}"),
+                    "resource" => self.resource = format!("{v:?}"),
+                    _ => {}
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<Row>>>);
+        impl Subscriber for Capture {
+            fn enabled(&self, m: &Metadata<'_>) -> bool {
+                m.target() == "victory_gpu::dispatch_probe"
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut row = Row::default();
+                event.record(&mut row);
+                self.0.lock().unwrap().push(row);
+            }
+        }
+
+        let host = crate::host::host().expect("requires WARP or a D3D12 adapter");
+        let null: This = std::ptr::null();
+        const RTV: u32 = 0x4;
+        const UAV: u32 = 0x8;
+        const SRV: u32 = 0xc0;
+        let create = |flags| {
+            let desc = ResourceDesc {
+                flags,
+                ..texture(8, 8, 61, 1)
+            };
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    RTV,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+        let input = create(1);
+        let output = create(1 | 4);
+        let input_rtv = host.rtv(host_resource(input).unwrap(), None);
+        let output_rtv = host.rtv(host_resource(output).unwrap(), None);
+        let heap = HostHeap::new(false, 3).unwrap();
+        let input_view = View::Shader(input as usize, None);
+        let output_view =
+            View::Unordered(output as usize, 0, Some([61, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        heap.make_at(0, &input_view);
+        heap.make_at(1, &output_view);
+        heap.make_null(2);
+
+        const COPY: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+Texture2D<float> src : register(t0);
+RWTexture2D<unorm float> dst : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) { dst[id.xy] = src.Load(int3(id.xy, 0)); }
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: live source and output; blob and roots live through PSO creation.
+        let (root, pso) = unsafe {
+            D3DCompile(
+                COPY.as_ptr().cast(),
+                COPY.len(),
+                s!("probe"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, input, RTV);
+        crate::list::ensure_state(&list, output, RTV);
+        // SAFETY: live RTVs and an open list.
+        unsafe {
+            let left = RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 8,
+            };
+            list.list.ClearRenderTargetView(input_rtv, &[0.0; 4], None);
+            list.list
+                .ClearRenderTargetView(input_rtv, &[1.0, 0.0, 0.0, 0.0], Some(&[left]));
+            list.list.ClearRenderTargetView(output_rtv, &[0.0; 4], None);
+        }
+        crate::list::ensure_state(&list, input, SRV);
+        crate::list::ensure_state(&list, output, UAV);
+        let mut probe = Probe::new(1, "0000000000000001");
+        probe.observe(ResourceType::Srv, &input_view, &heap, 0);
+        probe.observe(ResourceType::Uav, &output_view, &heap, 1);
+        // Even when it names a real guest texture, a rejected/null host slot
+        // must not produce a sample. The final event count checks this.
+        probe.observe(
+            ResourceType::Uav,
+            &View::Unordered(input as usize, 0, None),
+            &heap,
+            2,
+        );
+        probe.record(&list, false);
+        // SAFETY: the states, heap, and compute pipeline are set for the copy.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(1, 1, 1);
+        }
+        probe.record(&list, true);
+        crate::list::ensure_state(&list, output, RTV);
+        // SAFETY: the output is now a render target again.
+        unsafe { list.list.ClearRenderTargetView(output_rtv, &[0.0; 4], None) };
+        probe.record(&list, true);
+        list.close();
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(samples.clone()), || host.execute(&[&list]));
+        let samples = samples.lock().unwrap();
+        let before = Row {
+            phase: "Before".into(),
+            resource: format!("{:#x}", input as usize),
+            nonzero: 32,
+            max_raw: 255,
+        };
+        let after = Row {
+            phase: "After".into(),
+            resource: format!("{:#x}", output as usize),
+            nonzero: 32,
+            max_raw: 255,
+        };
+        let end = Row {
+            phase: "After".into(),
+            resource: after.resource.clone(),
+            nonzero: 0,
+            max_raw: 0,
+        };
+        assert_eq!(samples.as_slice(), &[before, after, end]);
+        println!(
+            "dispatch probe: input 32, immediate output 32, same output after a later clear 0"
+        );
+        for resource in [input, output] {
+            slot::<Release>(resource, 0x10)(resource);
+        }
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

@@ -118,6 +118,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_DISPATCH_PROBE=<frame>:<shader_hash>` | logs R8 texture counts before/after one direct compute dispatch by recording frame and shader hash |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
@@ -127,6 +128,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+The dispatch probe uses the first matching, successfully bound direct dispatch
+recorded for that frame. It reads at most two distinct backed, single-subresource
+R8 textures on each side, and prints resource IDs, nonzero pixel counts and raw
+maxima after the host fence. Use the recording frame from your own capture; it
+can vary across runs. The probe writes no images. It covers statically tracked
+SRV/UAV descriptor table entries, not bindless lookups, indirect dispatches,
+or textures whose descriptors are rewritten after recording. If the selected
+list is discarded before submission there is no sample.
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

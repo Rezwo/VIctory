@@ -411,6 +411,8 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    #[cfg(feature = "diagnostics")]
+    dispatch_probes: Vec<crate::capture::dispatch_probe::Sample>,
 }
 
 impl Host {
@@ -573,6 +575,24 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        // Readbacks keep their resources until list reset; do not map on a failed wait.
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::dispatch_probe::pending() {
+            // SAFETY: query our live fence. Device removal returns u64::MAX.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed != u64::MAX && completed >= *submitted {
+                let mut reported = false;
+                for list in runs {
+                    for sample in &list.deferred().dispatch_probes {
+                        sample.report(*submitted);
+                        reported = true;
+                    }
+                }
+                if reported {
+                    crate::capture::dispatch_probe::finish_reporting();
+                }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1010,6 +1030,43 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Temporarily move an already-bound texture to COPY_SOURCE inside this
+    /// list; the copy is recorded between the two barriers, without changing
+    /// the original tracked state for this dispatch or the next one.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn with_probe_copy_source<T>(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        record: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, before, _) = states.get(&(std::sync::Arc::as_ptr(copy) as usize))?;
+        let before = D3D12_RESOURCE_STATES(*before as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        if before != source {
+            // SAFETY: the resource is live, tracked, and the list is open.
+            unsafe {
+                self.list
+                    .ResourceBarrier(&[transition(&copy.texture, before, source)])
+            };
+        }
+        let result = record();
+        if before != source {
+            // SAFETY: the temporary state change above precedes this one.
+            unsafe {
+                self.list
+                    .ResourceBarrier(&[transition(&copy.texture, source, before)])
+            };
+        }
+        Some(result)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn retain_dispatch_probe(&self, sample: crate::capture::dispatch_probe::Sample) {
+        self.deferred().dispatch_probes.push(sample);
+        crate::capture::dispatch_probe::mark_pending();
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

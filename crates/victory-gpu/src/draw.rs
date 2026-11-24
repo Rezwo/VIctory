@@ -79,6 +79,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    #[cfg(feature = "diagnostics")]
+    dispatch_probe: Option<crate::capture::dispatch_probe::Probe>,
 }
 
 impl Drop for State {
@@ -538,14 +540,32 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dispatch_probe = crate::capture::dispatch_probe::Probe::selected(p);
+        }
+        let bound = self.bind(list, p, true);
+        #[cfg(feature = "diagnostics")]
+        let probe = self
+            .dispatch_probe
+            .take()
+            .filter(|probe| bound && probe.claim());
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(probe) = &probe {
+            probe.record(list, false);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(probe) = &probe {
+            probe.record(list, true);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -618,7 +638,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -630,7 +650,22 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            self.ready_table_view(list, u, &view, host, index);
+        }
+    }
+
+    fn ready_table_view(
+        &mut self,
+        list: &HostList,
+        u: &UsedResource,
+        view: &View,
+        _heap: &crate::descriptor::host::HostHeap,
+        _index: u32,
+    ) {
+        readable(list, u, view);
+        #[cfg(feature = "diagnostics")]
+        if let Some(probe) = &mut self.dispatch_probe {
+            probe.observe(u.kind, view, _heap, _index);
         }
     }
 
@@ -717,7 +752,13 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        self.ready_table_view(
+                            list,
+                            u,
+                            &view,
+                            host,
+                            first + u.table_offset_dwords / 8,
+                        );
                     }
                 }
                 made.push((slot, first * 32));
@@ -752,7 +793,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            self.ready_table_view(list, u, &view, host, index);
                         }
                     }
                     None => {

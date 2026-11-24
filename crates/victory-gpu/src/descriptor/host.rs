@@ -288,6 +288,18 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Whether this made slot actually points at the claimed texture, not a null view.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn probe_slot_backs(&self, index: u32, texture: &ID3D12Resource) -> bool {
+        use windows::core::Interface;
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|r| r.as_raw() == texture.as_raw())
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -414,6 +426,34 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
         std::ptr::from_ref(&words)
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
+    }
+}
+
+/// Only probe descriptor views of the first mip and plane of an R8 2D texture.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_r8_view(view: &View) -> bool {
+    let r8 = |format| matches!(format, DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_UINT);
+    match view {
+        View::Shader(_, None) | View::Unordered(_, _, None) => true,
+        View::Shader(_, Some(words)) => {
+            let desc = srv_desc(words);
+            if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || !r8(desc.Format) {
+                return false;
+            }
+            // SAFETY: Texture2D is the member for this view dimension.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            view.MostDetailedMip == 0 && view.PlaneSlice == 0 && matches!(view.MipLevels, 1 | u32::MAX)
+        }
+        View::Unordered(_, _, Some(words)) => {
+            let desc = uav_desc(words);
+            if desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || !r8(desc.Format) {
+                return false;
+            }
+            // SAFETY: Texture2D is the member for this view dimension.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            view.MipSlice == 0 && view.PlaneSlice == 0
+        }
+        _ => false,
     }
 }
 
